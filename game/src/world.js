@@ -1,399 +1,301 @@
-// Ember Court's rules and state, with no drawing and no browser in it: two
-// duelists, three lanes, a 24-card deck each, mana that grows one crystal a
-// turn, and combat that resolves lane by lane. Every mutating call returns
-// what happened (events and a hit list) so the caller can react — animate,
-// announce, or screenshot — without the world knowing about screens.
-import { CARDS, buildDeck } from './deck.js';
-import { LANES, MAX_HAND, MAX_MANA, START_HAND, START_HP } from './config.js';
-import { shuffle } from './random.js';
+// The rules of Ember Court, with no drawing and no browser in it: two courtiers at
+// 30 health, three lanes, a 24-card deck each, mana that grows one a round to 10.
+// Creatures strike across their lane at the end of every round: the creature opposite,
+// or the courtier when the lane is empty. A new creature rests a round unless it is
+// Swift; Ward ignores the first hit. The first courtier at 0 health loses.
 
-export const EVENT_PLAY = 1;
-export const EVENT_DAMAGE = 2;
-export const EVENT_HEAL = 4;
-export const EVENT_DRAW = 8;
-export const EVENT_WIN = 16;
-export const EVENT_LOSS = 32;
-export const EVENT_TURN = 64;
+import { HAND_LIMIT, LANES, MAX_MANA, START_HAND, START_HP } from './config.js';
+import { buildDeck, findDef } from './cards.js';
 
-let nextUid = 1;
+export const SIDE_YOU = 'you';
+export const SIDE_FOE = 'foe';
 
-function makeCreature(def) {
+/** How many log lines the table keeps. */
+const LOG_KEEP = 6;
+
+function freshSide() {
+  return { hp: START_HP, maxHp: START_HP, mana: 0, maxMana: 0, shield: 0, deck: [], hand: [] };
+}
+
+function otherSide(side) {
+  return side === SIDE_YOU ? SIDE_FOE : SIDE_YOU;
+}
+
+function pushLog(state, message) {
+  state.log.push(message);
+  while (state.log.length > LOG_KEEP) state.log.shift();
+}
+
+/** A creature on the table, from a card: health that can fall, ward that can break. */
+export function makeCreature(card, owner, round) {
   return {
-    uid: nextUid,
-    defId: def.id,
-    attack: def.attack,
-    health: def.health,
-    maxHealth: def.health,
-    ward: Boolean(def.ward),
-    rested: !def.swift,
+    uid: card.uid,
+    defId: card.defId,
+    name: card.name,
+    element: card.element,
+    cost: card.cost,
+    attack: card.attack,
+    health: card.health,
+    maxHealth: card.health,
+    swift: card.swift,
+    ward: card.ward,
+    text: card.text,
+    owner,
+    summonedRound: round,
   };
 }
 
-function makeSide(random, name) {
-  return {
-    name,
-    hp: START_HP,
-    maxHp: START_HP,
-    mana: 0,
-    maxMana: 0,
-    deck: buildDeck(random, shuffle),
-    hand: [],
-    discard: [],
-    lanes: new Array(LANES).fill(null),
-  };
+/** Place a creature straight onto a lane (used to stage the title screen's table). */
+export function spawnCreature(state, side, defId, lane) {
+  const def = findDef(defId);
+  if (def === null || lane < 0 || lane >= LANES) return null;
+  const creature = makeCreature(
+    { uid: state.uidCounter, defId: def.id, name: def.name, element: def.element, cost: def.cost, attack: def.attack, health: def.health, swift: def.swift === true, ward: def.ward === true, text: def.text },
+    side,
+    state.round - 1,
+  );
+  state.uidCounter += 1;
+  state.lanes[lane][side] = creature;
+  return creature;
 }
 
 export function createWorld(random) {
   const state = {
     round: 0,
-    phase: 'player',
-    winner: null,
+    over: null,
+    you: freshSide(),
+    foe: freshSide(),
+    lanes: [],
     log: [],
-    player: null,
-    enemy: null,
-    damageDealt: 0,
-    damageTaken: 0,
-    cardsPlayed: 0,
+    stats: { damageDealt: 0, damageTaken: 0, cardsPlayed: 0, creaturesPlayed: 0, spellsCast: 0 },
+    uidCounter: 1,
   };
+  for (let lane = 0; lane < LANES; lane += 1) state.lanes.push({ you: null, foe: null });
 
-  function logLine(text) {
-    state.log.push(text);
-    if (state.log.length > 6) state.log.shift();
+  function nextUid() {
+    const uid = state.uidCounter;
+    state.uidCounter += 1;
+    return uid;
   }
 
-  /** 'You' for the player, 'The Magistrate' for the enemy; verbs agree. */
-  function subj(side) {
-    return side === state.player ? 'You' : 'The Magistrate';
-  }
-  function conj(side, youForm, heForm) {
-    return side === state.player ? youForm : heForm;
-  }
-
-  function other(side) {
-    return side === state.player ? state.enemy : state.player;
+  function drawCard(side) {
+    const holder = state[side];
+    if (holder.deck.length === 0) return null;
+    if (holder.hand.length >= HAND_LIMIT) return null;
+    const card = holder.deck.pop();
+    holder.hand.push(card);
+    return card;
   }
 
-  function drawCards(side, count) {
-    let drawn = 0;
-    for (let index = 0; index < count; index += 1) {
-      if (side.deck.length === 0) {
-        if (side.discard.length === 0) break;
-        side.deck = shuffle(side.discard.splice(0), random);
-        logLine(`${subj(side)} ${conj(side, 'reshuffle', 'reshuffles')} the discard into the deck.`);
-      }
-      if (side.hand.length >= MAX_HAND) {
-        side.deck.shift();
-        continue;
-      }
-      side.hand.push(side.deck.shift());
-      drawn += 1;
+  function checkOver() {
+    if (state.over !== null) return;
+    if (state.foe.hp <= 0) {
+      state.over = 'won';
+      pushLog(state, 'The Magistrate falls. Victory is yours!');
+    } else if (state.you.hp <= 0) {
+      state.over = 'lost';
+      pushLog(state, 'Your health is spent. The court is lost.');
     }
-    return drawn;
   }
 
-  function checkEnd() {
-    if (state.enemy.hp <= 0) {
-      state.winner = 'player';
-      state.phase = 'over';
-      return EVENT_WIN;
-    }
-    if (state.player.hp <= 0) {
-      state.winner = 'enemy';
-      state.phase = 'over';
-      return EVENT_LOSS;
-    }
-    return 0;
-  }
-
-  /** Deal damage to a creature (Ward eats the first hit) or a courtier. */
-  function hurtCreature(side, lane, amount) {
-    const creature = side.lanes[lane];
-    if (creature === null) return 0;
+  function damageCreature(targetSide, lane, amount, sourceSide) {
+    const creature = state.lanes[lane][targetSide];
+    if (creature === null) return false;
     if (creature.ward) {
       creature.ward = false;
-      return 0;
+      pushLog(state, `${creature.name}'s Ward blocks the hit.`);
+      return true;
     }
     creature.health -= amount;
+    if (sourceSide === SIDE_YOU) state.stats.damageDealt += amount;
+    else state.stats.damageTaken += amount;
+    pushLog(state, `${creature.name} takes ${amount} damage.`);
     if (creature.health <= 0) {
-      side.discard.push(creature.defId);
-      side.lanes[lane] = null;
+      state.lanes[lane][targetSide] = null;
+      pushLog(state, `${creature.name} is destroyed.`);
     }
-    return amount;
+    return true;
   }
 
-  function hurtCourtier(side, amount) {
-    side.hp = Math.max(0, side.hp - amount);
-    if (side === state.enemy) state.damageDealt += amount;
-    else state.damageTaken += amount;
-    return checkEnd();
+  function damageFace(targetSide, amount, sourceSide) {
+    const holder = state[targetSide];
+    const soaked = Math.min(holder.shield, amount);
+    if (soaked > 0) {
+      holder.shield -= soaked;
+      pushLog(state, `Shield soaks ${soaked} damage.`);
+    }
+    const rest = amount - soaked;
+    if (rest > 0) {
+      holder.hp -= rest;
+      if (sourceSide === SIDE_YOU) state.stats.damageDealt += rest;
+      else state.stats.damageTaken += rest;
+      pushLog(state, `${targetSide === SIDE_YOU ? 'You take' : 'The Magistrate takes'} ${rest} damage.`);
+    }
+    checkOver();
   }
 
-  function resolveSpell(side, def, hits) {
-    const foe = other(side);
-    let events = 0;
-    if (def.effect === 'bolt') {
-      let lane = -1;
-      let best = -1;
-      for (let index = 0; index < LANES; index += 1) {
-        const creature = foe.lanes[index];
-        if (creature !== null && creature.health > best) {
-          best = creature.health;
-          lane = index;
-        }
-      }
-      if (lane >= 0) {
-        const dealt = hurtCreature(foe, lane, 3);
-        hits.push({ side: 'enemy', lane, amount: dealt, kind: 'spell' });
-        logLine(`${subj(side)} ${conj(side, 'cast', 'casts')} Emberbolt — 3 damage in lane ${lane + 1}.`);
-        events |= EVENT_DAMAGE;
-      } else {
-        events |= hurtCourtier(foe, 2);
-        hits.push({ side: 'enemy', lane: -1, amount: 2, kind: 'spell' });
-        logLine(`${subj(side)} ${conj(side, 'cast', 'casts')} Emberbolt straight at the courtier.`);
-        events |= EVENT_DAMAGE;
-      }
-    } else if (def.effect === 'mend') {
-      const healed = Math.min(6, side.maxHp - side.hp);
-      side.hp += healed;
-      logLine(`${subj(side)} ${conj(side, 'cast', 'casts')} Mend and ${conj(side, 'recover', 'recovers')} ${healed} health.`);
-      events |= EVENT_HEAL;
-    } else if (def.effect === 'draw') {
-      const drawn = drawCards(side, 2);
-      logLine(`${subj(side)} ${conj(side, 'cast', 'casts')} Insight and ${conj(side, 'draw', 'draws')} ${drawn}.`);
-      events |= EVENT_DRAW;
-    } else if (def.effect === 'shield') {
-      for (let index = 0; index < LANES; index += 1) {
-        const creature = side.lanes[index];
-        if (creature !== null) {
-          creature.maxHealth += 2;
-          creature.health += 2;
-        }
-      }
-      logLine(`${subj(side)} ${conj(side, 'raise', 'raises')} a Briar Shield — creatures +2 health.`);
-      events |= EVENT_HEAL;
-    } else if (def.effect === 'burst') {
-      for (let index = 0; index < LANES; index += 1) {
-        if (foe.lanes[index] !== null) {
-          const dealt = hurtCreature(foe, index, 2);
-          hits.push({ side: 'enemy', lane: index, amount: dealt, kind: 'spell' });
-        }
-      }
-      logLine(`${subj(side)} ${conj(side, 'cast', 'casts')} Gale Burst — 2 damage to every foe.`);
-      events |= EVENT_DAMAGE;
-    } else if (def.effect === 'surge') {
-      events |= hurtCourtier(foe, 4);
-      hits.push({ side: 'enemy', lane: -1, amount: 4, kind: 'spell' });
-      logLine(`${subj(side)} ${conj(side, 'cast', 'casts')} Tide Surge — 4 damage to the courtier.`);
-      events |= EVENT_DAMAGE;
-    } else if (def.effect === 'nova') {
-      for (let index = 0; index < LANES; index += 1) {
-        if (foe.lanes[index] !== null) {
-          const dealt = hurtCreature(foe, index, 3);
-          hits.push({ side: 'enemy', lane: index, amount: dealt, kind: 'spell' });
-        }
-      }
-      events |= hurtCourtier(foe, 2);
-      hits.push({ side: 'enemy', lane: -1, amount: 2, kind: 'spell' });
-      logLine(`${subj(side)} ${conj(side, 'cast', 'casts')} Ember Nova — fire everywhere.`);
-      events |= EVENT_DAMAGE;
-    }
-    return events;
+  function healFace(targetSide, amount) {
+    const holder = state[targetSide];
+    const healed = Math.min(holder.maxHp - holder.hp, amount);
+    holder.hp += healed;
+    pushLog(state, `${targetSide === SIDE_YOU ? 'You restore' : 'The Magistrate restores'} ${healed} health.`);
   }
 
-  function startTurn(side, isPlayer) {
-    if (isPlayer) state.round += 1;
-    side.maxMana = Math.min(MAX_MANA, state.round);
-    side.mana = side.maxMana;
-    for (let index = 0; index < LANES; index += 1) {
-      if (side.lanes[index] !== null) side.lanes[index].rested = false;
-    }
-    drawCards(side, 1);
+  function canAttack(creature) {
+    return creature.swift || creature.summonedRound < state.round;
   }
 
-  /**
-   * Play the card at `handIndex`. Creatures need a free `lane` (0-2); spells
-   * ignore it. Returns { events, hits, ok, reason }.
-   */
-  function playCard(side, handIndex, lane) {
-    if (state.phase === 'over') return { events: 0, hits: [], ok: false, reason: 'The duel is over.' };
-    const defId = side.hand[handIndex];
-    if (defId === undefined) return { events: 0, hits: [], ok: false, reason: 'No card there.' };
-    const def = CARDS[defId];
-    if (def.cost > side.mana) return { events: 0, hits: [], ok: false, reason: 'Not enough mana.' };
-    if (def.kind === 'creature') {
-      if (lane < 0 || lane >= LANES) return { events: 0, hits: [], ok: false, reason: 'Pick a lane.' };
-      if (side.lanes[lane] !== null) return { events: 0, hits: [], ok: false, reason: 'That lane is taken.' };
-    }
-    side.hand.splice(handIndex, 1);
-    side.mana -= def.cost;
-    side.discard.push(defId);
-    state.cardsPlayed += 1;
-    const hits = [];
-    let events = EVENT_PLAY;
-    if (def.kind === 'creature') {
-      nextUid += 1;
-      side.lanes[lane] = makeCreature(def);
-      logLine(`${subj(side)} ${conj(side, 'play', 'plays')} ${def.name} — lane ${lane + 1}.`);
+  function strike(attackerSide, lane) {
+    const attacker = state.lanes[lane][attackerSide];
+    if (attacker === null || !canAttack(attacker)) return;
+    const defenderSide = otherSide(attackerSide);
+    const defender = state.lanes[lane][defenderSide];
+    if (defender !== null) {
+      pushLog(state, `${attacker.name} strikes ${defender.name}.`);
+      damageCreature(defenderSide, lane, attacker.attack, attackerSide);
     } else {
-      events |= resolveSpell(side, def, hits);
+      pushLog(state, `${attacker.name} strikes the ${defenderSide === SIDE_YOU ? 'courtier' : 'Magistrate'}.`);
+      damageFace(defenderSide, attacker.attack, attackerSide);
     }
-    events |= checkEnd();
-    return { events, hits, ok: true, reason: '' };
   }
 
-  /** Each ready creature strikes across its lane: the foe opposite, or the courtier. */
-  function combat(attackerSide) {
-    const defender = other(attackerSide);
-    const hits = [];
-    let events = 0;
-    for (let lane = 0; lane < LANES; lane += 1) {
-      const creature = attackerSide.lanes[lane];
-      if (creature === null || creature.rested) continue;
-      const target = defender.lanes[lane];
-      if (target !== null) {
-        const dealt = hurtCreature(defender, lane, creature.attack);
-        hits.push({ side: attackerSide === state.player ? 'enemy' : 'player', lane, amount: dealt, kind: 'hit' });
-        logLine(`${creatureName(creature)} strikes lane ${lane + 1} for ${creature.attack}.`);
-        events |= EVENT_DAMAGE;
-      } else {
-        events |= hurtCourtier(defender, creature.attack);
-        hits.push({ side: attackerSide === state.player ? 'enemy' : 'player', lane, amount: creature.attack, kind: 'hit' });
-        logLine(`${creatureName(creature)} hits the courtier for ${creature.attack}.`);
-        events |= EVENT_DAMAGE;
-      }
-      if (state.phase === 'over') break;
+  function beginGame() {
+    state.round = 1;
+    state.over = null;
+    state.you = freshSide();
+    state.foe = freshSide();
+    state.lanes = [];
+    for (let lane = 0; lane < LANES; lane += 1) state.lanes.push({ you: null, foe: null });
+    state.log = [];
+    state.stats = { damageDealt: 0, damageTaken: 0, cardsPlayed: 0, creaturesPlayed: 0, spellsCast: 0 };
+    state.you.deck = buildDeck(random, nextUid);
+    state.foe.deck = buildDeck(random, nextUid);
+    for (let i = 0; i < START_HAND; i += 1) {
+      drawCard(SIDE_YOU);
+      drawCard(SIDE_FOE);
     }
-    return { events, hits };
+    state.you.maxMana = 1;
+    state.you.mana = 1;
+    state.foe.maxMana = 1;
+    state.foe.mana = 1;
+    pushLog(state, 'Round 1 — the court is in session. Your move.');
   }
 
-  function creatureName(creature) {
-    return CARDS[creature.defId].name;
+  /** Play a creature from hand into a lane. Returns { ok, reason }. */
+  function playCreatureCard(side, handIndex, lane) {
+    const holder = state[side];
+    const card = holder.hand[handIndex];
+    if (card === undefined) return { ok: false, reason: 'no such card' };
+    if (card.type !== 'creature') return { ok: false, reason: 'not a creature' };
+    if (lane < 0 || lane >= LANES) return { ok: false, reason: 'no such lane' };
+    if (state.lanes[lane][side] !== null) return { ok: false, reason: 'lane is full' };
+    if (holder.mana < card.cost) return { ok: false, reason: 'not enough mana' };
+    holder.hand.splice(handIndex, 1);
+    holder.mana -= card.cost;
+    state.lanes[lane][side] = makeCreature(card, side, state.round);
+    if (side === SIDE_YOU) {
+      state.stats.cardsPlayed += 1;
+      state.stats.creaturesPlayed += 1;
+    }
+    pushLog(state, `${side === SIDE_YOU ? 'You play' : 'The Magistrate plays'} ${card.name} in lane ${lane + 1}.`);
+    return { ok: true };
   }
 
   /**
-   * The heuristic both the AI and the screenshot autopilot use. `skill` picks
-   * how it plays: 'strong' spends mana on the best cards it can afford,
-   * 'weak' plays one random affordable card and stops, 'passive' plays nothing.
-   * Returns the list of moves it made, as { handIndex, lane } pairs.
+   * Cast a spell from hand. `target` is { kind: 'face' } (the enemy courtier),
+   * { kind: 'creature', lane, side } (any creature on the table), or { kind: 'self' }
+   * for spells that only touch their caster. Returns { ok, reason }.
    */
-  function chooseMoves(side, skill) {
-    if (skill === 'passive') return [];
-    const moves = [];
-    const foe = other(side);
-    const hand = side.hand;
-    let mana = side.mana;
-    // Score every playable card once; strong plays in score order, weak once at random.
-    const options = [];
-    for (let handIndex = 0; handIndex < hand.length; handIndex += 1) {
-      const def = CARDS[hand[handIndex]];
-      if (def.cost > mana) continue;
-      if (def.kind === 'creature') {
-        for (let lane = 0; lane < LANES; lane += 1) {
-          if (side.lanes[lane] === null) {
-            const foeCreature = foe.lanes[lane];
-            const score = def.attack * 2 + def.health + (foeCreature === null ? 3 : 0) + (def.swift ? 1 : 0) + (def.ward ? 1 : 0) - def.cost;
-            options.push({ handIndex, lane, score });
-          }
-        }
-      } else {
-        let score = 2;
-        if (def.effect === 'bolt' && foe.lanes.some((c) => c !== null)) score = 5;
-        if (def.effect === 'surge' && foe.hp <= 8) score = 8;
-        if (def.effect === 'mend' && side.hp <= side.maxHp - 6) score = 6;
-        if (def.effect === 'draw') score = 4;
-        if (def.effect === 'nova' && foe.lanes.some((c) => c !== null)) score = 7;
-        options.push({ handIndex, lane: -1, score: score - def.cost });
+  function castSpellCard(side, handIndex, target) {
+    const holder = state[side];
+    const card = holder.hand[handIndex];
+    if (card === undefined) return { ok: false, reason: 'no such card' };
+    if (card.type !== 'spell') return { ok: false, reason: 'not a spell' };
+    if (holder.mana < card.cost) return { ok: false, reason: 'not enough mana' };
+    const enemy = otherSide(side);
+    if (card.effect === 'damage3') {
+      if (target === null) return { ok: false, reason: 'pick a target' };
+      if (target.kind === 'face') {
+        // Face means the enemy courtier.
+      } else if (target.kind === 'creature') {
+        if (state.lanes[target.lane] === undefined || state.lanes[target.lane][target.side] === null) return { ok: false, reason: 'no creature there' };
+      } else return { ok: false, reason: 'bad target' };
+    }
+    holder.hand.splice(handIndex, 1);
+    holder.mana -= card.cost;
+    if (side === SIDE_YOU) {
+      state.stats.cardsPlayed += 1;
+      state.stats.spellsCast += 1;
+    }
+    const who = side === SIDE_YOU ? 'You cast' : 'The Magistrate casts';
+    if (card.effect === 'damage3') {
+      pushLog(state, `${who} ${card.name}.`);
+      if (target.kind === 'face') damageFace(enemy, 3, side);
+      else damageCreature(target.side, target.lane, 3, side);
+    } else if (card.effect === 'damageFace4') {
+      pushLog(state, `${who} ${card.name}.`);
+      damageFace(enemy, 4, side);
+    } else if (card.effect === 'heal6') {
+      pushLog(state, `${who} ${card.name}.`);
+      healFace(side, 6);
+    } else if (card.effect === 'draw2') {
+      pushLog(state, `${who} ${card.name}.`);
+      drawCard(side);
+      drawCard(side);
+    } else if (card.effect === 'shield6') {
+      holder.shield += 6;
+      pushLog(state, `${who} ${card.name} (+6 shield).`);
+    } else if (card.effect === 'damageAll2') {
+      pushLog(state, `${who} ${card.name}.`);
+      for (let lane = 0; lane < LANES; lane += 1) {
+        if (state.lanes[lane][enemy] !== null) damageCreature(enemy, lane, 2, side);
+        if (state.over !== null) break;
       }
+    } else {
+      return { ok: false, reason: 'unknown spell' };
     }
-    if (skill === 'weak') {
-      if (options.length === 0) return moves;
-      const pick = options[Math.floor(random() * options.length)];
-      moves.push({ handIndex: pick.handIndex, lane: pick.lane });
-      return moves;
-    }
-    options.sort((a, b) => b.score - a.score);
-    const usedLanes = new Set();
-    for (const option of options) {
-      const def = CARDS[hand[option.handIndex]];
-      if (def.cost > mana) continue;
-      if (def.kind === 'creature' && usedLanes.has(option.lane)) continue;
-      moves.push({ handIndex: option.handIndex, lane: option.lane, defId: hand[option.handIndex] });
-      mana -= def.cost;
-      if (def.kind === 'creature') usedLanes.add(option.lane);
-    }
-    return moves;
+    return { ok: true };
   }
 
-  /** Apply a list of moves (from chooseMoves) to `side`, re-finding each card by id. */
-  function applyMoves(side, moves) {
-    const hits = [];
-    let events = 0;
-    for (const move of moves) {
-      const handIndex = side.hand.indexOf(move.defId);
-      if (handIndex < 0) continue;
-      const result = playCard(side, handIndex, move.lane);
-      events |= result.events;
-      hits.push(...result.hits);
-      if (state.phase === 'over') break;
+  /**
+   * Every creature that can strike does, lane by lane. Initiative alternates each
+   * round: on odd rounds you strike first in each lane, on even rounds the
+   * Magistrate does — otherwise moving first would win every trade.
+   */
+  function combat() {
+    const first = state.round % 2 === 1 ? SIDE_YOU : SIDE_FOE;
+    const second = otherSide(first);
+    pushLog(state, first === SIDE_YOU ? '— Combat: you strike first —' : '— Combat: the Magistrate strikes first —');
+    for (let lane = 0; lane < LANES; lane += 1) {
+      if (state.over !== null) return;
+      strike(first, lane);
+      if (state.over !== null) return;
+      strike(second, lane);
     }
-    return { events, hits };
   }
 
-  /** The enemy's whole turn: draw, spend mana, then its creatures strike. */
-  function enemyTurn(skill) {
-    state.phase = 'enemy';
-    startTurn(state.enemy, false);
-    logLine(`Round ${state.round} — the Magistrate plays.`);
-    const moves = chooseMoves(state.enemy, skill);
-    const played = applyMoves(state.enemy, moves);
-    let events = played.events;
-    let hits = played.hits;
-    if (state.phase !== 'over') {
-      const fought = combat(state.enemy);
-      events |= fought.events;
-      hits = hits.concat(fought.hits);
+  /** A new round: mana grows, both sides draw. */
+  function nextRound() {
+    if (state.over !== null) return;
+    state.round += 1;
+    for (const side of [SIDE_YOU, SIDE_FOE]) {
+      const holder = state[side];
+      holder.maxMana = Math.min(MAX_MANA, state.round);
+      holder.mana = holder.maxMana;
+      drawCard(side);
     }
-    if (state.phase !== 'over') {
-      state.phase = 'player';
-      startTurn(state.player, true);
-      logLine(`Round ${state.round} — your move.`);
-      events |= EVENT_TURN;
-    }
-    return { events, hits };
+    pushLog(state, `Round ${state.round} — mana ${Math.min(MAX_MANA, state.round)}. Your move.`);
   }
 
-  /** End the player's turn: your creatures strike, then the enemy answers. */
-  function endPlayerTurn(enemySkill) {
-    if (state.phase !== 'player' || state.phase === 'over') return { events: 0, hits: [] };
-    let events = 0;
-    let hits = [];
-    const fought = combat(state.player);
-    events |= fought.events;
-    hits = hits.concat(fought.hits);
-    if (state.phase === 'over') return { events, hits };
-    const enemyResult = enemyTurn(enemySkill ?? 'strong');
-    events |= enemyResult.events;
-    hits = hits.concat(enemyResult.hits);
-    return { events, hits };
-  }
-
-  function reset() {
-    nextUid = 1;
-    state.round = 0;
-    state.phase = 'player';
-    state.winner = null;
-    state.log = [];
-    state.damageDealt = 0;
-    state.damageTaken = 0;
-    state.cardsPlayed = 0;
-    state.player = makeSide(random, 'You');
-    state.enemy = makeSide(random, 'The Magistrate');
-    drawCards(state.player, START_HAND);
-    drawCards(state.enemy, START_HAND);
-    startTurn(state.player, true);
-    logLine('The duel begins. Your move — play a card, then end your turn.');
-  }
-
-  reset();
-  return { state, reset, playCard, endPlayerTurn, enemyTurn, chooseMoves, applyMoves, startTurn };
+  return {
+    state,
+    beginGame,
+    drawCard,
+    playCreatureCard,
+    castSpellCard,
+    combat,
+    nextRound,
+    damageFace,
+    spawnCreature: (side, defId, lane) => spawnCreature(state, side, defId, lane),
+  };
 }

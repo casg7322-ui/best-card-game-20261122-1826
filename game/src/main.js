@@ -1,16 +1,16 @@
-// Boot and the one loop: input is read every frame, floating damage numbers
-// age out, and the renderer paints what is there. The game moves between
-// three screens: title, play and duel over.
+// Boot and the one loop: input is read every frame, the renderer paints what is
+// there. The game moves between four screens: title, play, victory and defeat.
 //
-// ?seed=N fixes the shuffle and the Magistrate's choices. ?shot=title|play|
-// win|loss (with &seed=N) stages that scene instead of running the loop,
-// paints it twice and sets window.__shotReady for a screenshot.
+// ?seed=N fixes the shuffle. ?shot=title|play|win|loss (with &seed=N) stages that
+// scene instead of running the loop, paints it twice and sets window.__shotReady
+// for a screenshot.
+
 import { BEST_KEY } from './config.js';
-import { CARDS } from './deck.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_LOSS, EVENT_WIN } from './world.js';
-import { createInput, KEY_CONFIRM, KEY_DESELECT } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE, endTurnRect, handCardRect, laneRect } from './render.js';
+import { createWorld } from './world.js';
+import { takeAiTurn } from './ai.js';
+import { ACTION_CONFIRM, ACTION_DESELECT, ACTION_END, createInput } from './input.js';
+import { createRenderer, layout, SCREEN_LOST, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WON } from './render.js';
 import { stageShot } from './shots.js';
 
 const params = new URLSearchParams(window.location.search);
@@ -19,16 +19,34 @@ const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
 const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
 
 const canvas = document.getElementById('game');
-canvas.width = 1280;
-canvas.height = 720;
 const status = document.getElementById('status');
 const world = createWorld(createRandom(seed));
+const aiRandom = createRandom((seed ^ 0x9e3779b9) >>> 0);
 const renderer = createRenderer(canvas);
 
-/** Floating damage numbers on the table, aged by the loop. */
-const floaters = [];
-let notice = '';
-let noticeUntil = 0;
+// --- tiny sounds: WebAudio blips, no files, silent when audio is unavailable ---
+let audio = null;
+function beep(freq, dur, type = 'sine', vol = 0.07) {
+  try {
+    audio ??= new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.value = vol;
+    osc.connect(gain);
+    gain.connect(audio.destination);
+    osc.start();
+    gain.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+    osc.stop(audio.currentTime + dur);
+  } catch {
+    // No audio here: the game plays on silently.
+  }
+}
+const soundPlay = () => beep(520, 0.09, 'triangle');
+const soundHit = () => beep(140, 0.12, 'sawtooth', 0.05);
+const soundWin = () => { beep(523, 0.14, 'triangle'); setTimeout(() => beep(659, 0.14, 'triangle'), 130); setTimeout(() => beep(784, 0.22, 'triangle'), 260); };
+const soundLose = () => { beep(330, 0.16, 'sine'); setTimeout(() => beep(247, 0.22, 'sine'), 160); };
 
 function readBest() {
   try {
@@ -42,46 +60,15 @@ function saveBest(value) {
   try {
     window.localStorage.setItem(BEST_KEY, String(value));
   } catch {
-    // Storage can be off (private windows): the best result then lasts this visit only.
+    // Storage can be off (private windows): the best then lasts this visit only.
   }
-}
-
-function addFloaters(hits) {
-  for (const hit of hits) {
-    if (hit.amount <= 0) continue;
-    if (hit.lane >= 0) {
-      const rect = laneRect(hit.side, hit.lane);
-      floaters.push({
-        x: rect.x + rect.width / 2,
-        y: rect.y + rect.height / 2,
-        text: `-${hit.amount}`,
-        color: hit.side === 'enemy' ? '#ffb199' : '#ff6b5e',
-        age: 0,
-      });
-    } else {
-      const atEnemy = hit.side === 'enemy';
-      floaters.push({
-        x: atEnemy ? 500 : 134,
-        y: atEnemy ? 29 : 349,
-        text: `-${hit.amount}`,
-        color: atEnemy ? '#ffb199' : '#ff6b5e',
-        age: 0,
-      });
-    }
-  }
-}
-
-function showNotice(text) {
-  notice = text;
-  noticeUntil = performance.now() + 1800;
 }
 
 function runShot(name) {
-  const scene = stageShot(name, world);
-  floaters.push(...scene.floaters);
+  const scene = stageShot(name, world, createRandom(seed));
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, { selected: null, selectedDef: null, hover: -1, floaters, notice: '' });
+    renderer.draw(world.state, scene.screen, { time: 0.2, selected: -1, hoverCard: -1 });
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -90,141 +77,186 @@ function runShot(name) {
 }
 
 function runGame() {
-  const input = createInput(canvas);
+  const input = createInput(canvas, renderer.toLogical);
   let screen = SCREEN_TITLE;
   let best = readBest();
-  let selected = null;
-  let last = performance.now();
+  const ui = { selected: -1, targetMode: false, hoverCard: -1, hoverEndTurn: false, time: 0, best };
+  // The title screen sits over a lively demo table, like the title screenshot.
+  stageShot('title', world, createRandom(seed));
 
   function announce(message) {
     status.textContent = message;
   }
 
   function startGame() {
-    world.reset();
-    selected = null;
-    floaters.length = 0;
+    world.beginGame();
+    ui.selected = -1;
+    ui.targetMode = false;
     screen = SCREEN_PLAY;
-    announce('Playing. Reduce the Magistrate to 0 health to win.');
+    announce('Playing. Round 1. Your move.');
   }
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    selected = null;
-    if (world.state.winner === 'player' && (best === 0 || world.state.round < best)) {
-      best = world.state.round;
-      saveBest(best);
-    }
-    announce(world.state.winner === 'player' ? `Victory in ${world.state.round} rounds.` : `Defeat in ${world.state.round} rounds.`);
-  }
-
-  function hoveredHandCard() {
-    if (!input.hover.inside) return -1;
-    const count = world.state.player.hand.length;
-    for (let index = 0; index < count; index += 1) {
-      const rect = handCardRect(index, count);
-      if (input.hover.x >= rect.x && input.hover.x <= rect.x + rect.width && input.hover.y >= rect.y - 18 && input.hover.y <= rect.y + rect.height) return index;
-    }
-    return -1;
-  }
-
-  function playHandCard(index) {
-    const defId = world.state.player.hand[index];
-    if (defId === undefined) return;
-    const def = CARDS[defId];
-    if (def.kind === 'spell') {
-      const result = world.playCard(world.state.player, index, -1);
-      if (!result.ok) showNotice(result.reason);
-      else addFloaters(result.hits);
-      selected = null;
-      if (result.events & (EVENT_WIN | EVENT_LOSS)) endGame();
-      return;
-    }
-    selected = selected === index ? null : index;
-  }
-
-  function playSelectedIntoLane(lane) {
-    if (selected === null) return;
-    const result = world.playCard(world.state.player, selected, lane);
-    if (!result.ok) showNotice(result.reason);
-    else {
-      addFloaters(result.hits);
-      selected = null;
-      if (result.events & (EVENT_WIN | EVENT_LOSS)) endGame();
+  function finishGame() {
+    screen = world.state.over === 'won' ? SCREEN_WON : SCREEN_LOST;
+    if (world.state.over === 'won') {
+      soundWin();
+      if (best === 0 || world.state.round < best) {
+        best = world.state.round;
+        ui.best = best;
+        saveBest(best);
+      }
+      announce(`Victory in ${world.state.round} rounds.`);
+    } else {
+      soundLose();
+      announce(`Defeat in ${world.state.round} rounds.`);
     }
   }
 
   function endTurn() {
-    if (world.state.phase !== 'player') return;
-    const result = world.endPlayerTurn('strong');
-    addFloaters(result.hits);
-    selected = null;
-    if (result.events & (EVENT_WIN | EVENT_LOSS)) endGame();
+    if (screen !== SCREEN_PLAY || world.state.over !== null) return;
+    ui.selected = -1;
+    ui.targetMode = false;
+    takeAiTurn(world, aiRandom, 'strong');
+    if (world.state.over === null) world.combat();
+    if (world.state.over !== null) {
+      soundHit();
+      finishGame();
+      return;
+    }
+    world.nextRound();
+    soundHit();
+  }
+
+  function selectCard(index) {
+    const card = world.state.you.hand[index];
+    if (card === undefined) return;
+    if (ui.selected === index) {
+      ui.selected = -1;
+      ui.targetMode = false;
+      return;
+    }
+    ui.selected = index;
+    ui.targetMode = false;
+    if (card.type === 'spell') {
+      if (card.target === 'self' || card.target === 'all-enemy') {
+        const result = world.castSpellCard('you', index, { kind: card.target });
+        if (result.ok) {
+          soundPlay();
+          ui.selected = -1;
+          if (world.state.over !== null) finishGame();
+        }
+      } else {
+        ui.targetMode = true;
+      }
+    }
+  }
+
+  function castTargeted(target) {
+    if (ui.selected < 0) return;
+    const result = world.castSpellCard('you', ui.selected, target);
+    ui.selected = -1;
+    ui.targetMode = false;
+    if (result.ok) {
+      soundPlay();
+      if (world.state.over !== null) finishGame();
+    }
   }
 
   function pointIn(point, rect) {
-    return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+    return point.x >= rect.x && point.x <= rect.x + rect.w && point.y >= rect.y && point.y <= rect.y + rect.h;
+  }
+
+  function pointInCircle(point, circle) {
+    const dx = point.x - circle.x;
+    const dy = point.y - circle.y;
+    return dx * dx + dy * dy <= circle.r * circle.r;
   }
 
   function handleClick(point) {
-    if (screen === SCREEN_TITLE || screen === SCREEN_OVER) {
+    if (screen === SCREEN_TITLE || screen === SCREEN_WON || screen === SCREEN_LOST) {
       startGame();
       return;
     }
-    if (world.state.phase !== 'player') return;
-    const endRect = endTurnRect();
-    if (pointIn(point, endRect)) {
+    const spots = layout(world.state);
+    if (pointIn(point, spots.endTurn)) {
       endTurn();
       return;
     }
-    const count = world.state.player.hand.length;
-    for (let index = 0; index < count; index += 1) {
-      if (pointIn(point, handCardRect(index, count))) {
-        playHandCard(index);
+    if (ui.targetMode) {
+      if (pointInCircle(point, spots.foePortrait)) {
+        castTargeted({ kind: 'face' });
+        return;
+      }
+      for (const lane of spots.lanes) {
+        for (const side of ['foe', 'you']) {
+          const creature = world.state.lanes[lane.lane][side];
+          if (creature !== null && pointIn(point, lane[side])) {
+            castTargeted({ kind: 'creature', lane: lane.lane, side });
+            return;
+          }
+        }
+      }
+      ui.selected = -1;
+      ui.targetMode = false;
+      return;
+    }
+    for (const spot of spots.handCards) {
+      if (pointIn(point, spot)) {
+        selectCard(spot.index);
         return;
       }
     }
-    if (selected !== null) {
-      for (let lane = 0; lane < 3; lane += 1) {
-        if (pointIn(point, laneRect('player', lane))) {
-          playSelectedIntoLane(lane);
+    const selected = world.state.you.hand[ui.selected];
+    if (selected !== undefined && selected.type === 'creature') {
+      for (const lane of spots.lanes) {
+        if (pointIn(point, lane.you)) {
+          const result = world.playCreatureCard('you', ui.selected, lane.lane);
+          ui.selected = -1;
+          if (result.ok) soundPlay();
           return;
         }
       }
     }
-    selected = null;
+    ui.selected = -1;
   }
 
-  function handleKey(key) {
-    if (key.kind === KEY_CONFIRM) {
-      if (screen === SCREEN_TITLE || screen === SCREEN_OVER) startGame();
-      else endTurn();
-    } else if (key.kind === KEY_DESELECT) {
-      selected = null;
-    } else if (key.kind === 'select') {
-      if (screen === SCREEN_PLAY) playHandCard(key.index);
+  function handleActions() {
+    const actions = input.takeActions();
+    const digit = input.takeDigit();
+    if (actions & ACTION_DESELECT) {
+      ui.selected = -1;
+      ui.targetMode = false;
     }
+    if (digit >= 1 && digit <= 7) selectCard(digit - 1);
+    if (actions & ACTION_CONFIRM) {
+      if (screen === SCREEN_TITLE || screen === SCREEN_WON || screen === SCREEN_LOST) startGame();
+    }
+    if (actions & ACTION_END) {
+      if (screen === SCREEN_PLAY) endTurn();
+      else if (screen === SCREEN_TITLE || screen === SCREEN_WON || screen === SCREEN_LOST) startGame();
+    }
+    for (const click of input.takeClicks()) handleClick(click);
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
-    const dt = Math.min(0.1, (now - last) / 1000);
-    last = now;
-    for (let index = floaters.length - 1; index >= 0; index -= 1) {
-      floaters[index].age += dt;
-      if (floaters[index].age > 1.1) floaters.splice(index, 1);
+    ui.time = now / 1000;
+    handleActions();
+    // Hover state for the card lift and the END TURN glow.
+    const mouse = input.mouse;
+    ui.hoverCard = -1;
+    ui.hoverEndTurn = false;
+    if (mouse.inside && screen === SCREEN_PLAY) {
+      const spots = layout(world.state);
+      for (const spot of spots.handCards) {
+        if (pointIn(mouse, spot)) ui.hoverCard = spot.index;
+      }
+      ui.hoverEndTurn = pointIn(mouse, spots.endTurn);
     }
-    for (const click of input.takeClicks()) handleClick(click);
-    for (const key of input.takeKeys()) handleKey(key);
-    const hover = hoveredHandCard();
-    const selectedDef = selected === null ? null : CARDS[world.state.player.hand[selected]];
-    const liveNotice = now < noticeUntil ? notice : '';
-    world.state.best = best;
-    renderer.draw(world.state, screen, { selected, selectedDef, hover, floaters, notice: liveNotice });
+    renderer.draw(world.state, screen, ui);
   }
 
-  // Leaving the tab does not change a turn-based duel; nothing to pause.
-  announce('Ember Court. Press Enter or click to begin.');
+  announce('Ember Court. Press Enter or click to take your seat.');
   requestAnimationFrame(frame);
 }
 

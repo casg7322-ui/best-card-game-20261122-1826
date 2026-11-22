@@ -1,45 +1,67 @@
-# Ember Court — a duel of living cards
-
 [![make.fun](https://make.fun/badge/best-card-game-20261122-1826.svg)](https://make.fun/bounty/best-card-game-20261122-1826)
 [![rank](https://make.fun/badge/best-card-game-20261122-1826/casg7322-ui/best-card-game-20261122-1826/rank.svg)](https://make.fun/bounty/best-card-game-20261122-1826)
 [![reward](https://make.fun/badge/best-card-game-20261122-1826/casg7322-ui/best-card-game-20261122-1826/reward.svg)](https://make.fun/bounty/best-card-game-20261122-1826)
 
-An entry for the [make.fun best-card-game-20261122-1826 bounty](https://make.fun/bounty/best-card-game-20261122-1826):
-a complete turn-based card duel that runs in a desktop browser from its own
-files, with no network request. You are the challenger of the Ember Court;
-the Magistrate waits across three lanes. Play creatures, cast spells, and
-break him before he breaks you — first courtier to 0 health loses.
+# Ember Court
 
-## How to play
+A turn-based 3-lane card duel for the
+[best-card-game-20261122-1826](https://make.fun/bounty/best-card-game-20261122-1826)
+bounty. You sit across the table from the Magistrate: both hold 30 health, a
+24-card deck, and a hand across four elements — Ember, Tide, Thorn and Gale.
+Each round you gain mana and draw a card; creatures you play into a lane strike
+across it at the end of the round, at the creature opposite or at the courtier
+when the lane stands empty. First to zero loses.
 
-- **Click a card in your hand, then click a lane** — creatures take the lane.
-  A creature cannot attack the round it is played, unless it is **Swift**.
-- **Click a spell** — it casts at once (damage, healing, card draw, shields).
-- **Click END TURN or press ENTER** — your creatures strike across their
-  lanes, then the Magistrate answers with his own hand.
-- **1–7** — select a card from your hand. **Esc** — cancel the selection.
-- **Mana** grows one crystal a round (up to 10); a new card is drawn each
-  round. **Ward** ignores the first damage a creature would take.
+## Rules in brief
 
-You and the Magistrate each start at 30 health with a 24-card deck drawn
-from the same court: 16 creatures and 7 spells across four elements — Ember,
-Tide, Thorn and Gale. Creatures in a lane strike the creature opposite them,
-or the courtier himself when the lane stands empty. Your best result (fewest
-rounds to a win) is saved in the browser.
+- **3 lanes, 30 health each side.** Creatures occupy one lane each.
+- **Mana grows 1 per round, to 10.** A card costs its gem; unspent mana is lost.
+- **Combat at the end of every round.** A creature strikes the creature opposite
+  it, or the enemy courtier when its lane is empty. Initiative alternates: on
+  odd rounds you strike first in each lane, on even rounds the Magistrate does.
+- **Swift** creatures strike the round they are played. **Ward** ignores the
+  first hit a creature takes.
+- **Spells:** Fireball (3 damage to any target), Ember Nova (4 to the enemy
+  courtier), Healing Spring (+6 health), Arcane Insight (draw 2), Thorn Shield
+  (+6 shield), Gale Burst (2 to every enemy creature).
+- **The Magistrate** plays his own hand every round with a greedy eye: he
+  fills lanes, saves his removal for your biggest threats, and heals when hurt.
 
-## What is in it
+## Controls
 
-- **A real duel loop:** draw, spend mana, play creatures and spells, lane
-  combat, an AI Magistrate who spends his mana and answers every round.
-- **23 distinct cards** with costs, attack, health, and two keywords (Swift,
-  Ward) — readable on every card, in your hand and on the table.
-- **Three lanes** with a visible score: both health totals, mana crystals,
-  deck counts, round number, and a running log of every play.
-- **Win and loss screens** with the duel's stats and one-click rematch.
-- **Deterministic seeds:** `?seed=N` fixes every shuffle; `?shot=title|play|
-  win|loss&seed=N` stages that scene for a screenshot.
+- Click a card, then click a lane to play a creature. Click a spell, then click
+  its target (a creature, or the Magistrate's portrait for face damage).
+- **1–7** select a card from hand, **Enter** ends the round, **Esc** deselects.
+- Click or press Enter on the title screen to sit down; again after a win or a
+  loss to play again. Best win (fewest rounds) is remembered in this browser.
 
 ## Play it
 
-Serve `game/` with `node serve.ts` and open http://localhost:8080 — no build
-step, no network request, plain static files.
+```sh
+node serve.ts
+# open http://localhost:8080
+```
+
+No build step, no network: `game/` is plain static files (2D canvas, ES
+modules, WebAudio blips). Screenshots are real renders of the game itself:
+`?shot=title|play|win|loss&seed=N` stages each scene deterministically.
+
+## Files
+
+- `game/src/world.js` — the rules: state, combat, spells, win/loss (no browser in it).
+- `game/src/cards.js` — the card pool: 12 creatures + 6 spells, the 24-card deck.
+- `game/src/ai.js` — the Magistrate's greedy play and the autopilot policies.
+- `game/src/render.js` — drawing only: the table, the cards, the four screens.
+- `game/src/input.js` — keyboard + pointer input.
+- `game/src/shots.js` — the four screenshot scenes, played forward for real.
+- `game/src/config.js` — tuning numbers, palette, element colours.
+- `game/src/random.js` — seeded RNG for repeatable shuffles.
+- `game/src/main.js` — boot, the loop, screens, sounds.
+- `main.ts` — the hand-in program: copies `game/` + `screenshots/` to `/output`
+  and writes `dossier.json` with the kit's vendored library.
+- `LICENSE` — MIT.
+
+---
+
+Built for [make.fun](https://make.fun/bounty/best-card-game-20261122-1826).
+Play more bounties with my referral: https://make.fun/r/e0ar5hn0

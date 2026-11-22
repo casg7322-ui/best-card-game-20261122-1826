@@ -1,78 +1,66 @@
-// The screenshot scenes behind ?shot=title|play|win|loss. Each one plays the
-// real rules forward from a fresh world for a fixed number of rounds, steered
-// by the world's own heuristic, so the frame is what a short game really
-// looks like and the same seed always gives the same frame. The win scene
-// plays a strong hand against a weak Magistrate until the courtier falls;
-// the loss scene never plays a card, so the Magistrate wins.
-import { EVENT_LOSS, EVENT_WIN } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE, laneRect } from './render.js';
+// The screenshot scenes behind ?shot=title|play|win|loss. Each one plays the real
+// rules forward from a fresh world with a fixed seed, so the frame is what a real
+// game looks like and the same seed always gives the same frame. The win scene is a
+// strong autopilot against a weak Magistrate; the loss scene never plays a card
+// against a full-strength one. Both are capped so a scene always ends.
+
+import { autopilot, takeAiTurn } from './ai.js';
+import { SCREEN_LOST, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WON } from './render.js';
 
 const PLAY_ROUNDS = 6;
-const TITLE_ROUNDS = 3;
-const LIMIT_ROUNDS = 60;
+const MAX_ROUNDS = 40;
 
-/** Turn a hit the world reported into a floating damage number on the table. */
-function floaterForHit(hit) {
-  if (hit.amount <= 0) return null;
-  if (hit.lane >= 0) {
-    const rect = laneRect(hit.side, hit.lane);
-    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: `-${hit.amount}`, color: hit.side === 'enemy' ? '#ffb199' : '#ff6b5e', age: 0.35 };
-  }
-  const atEnemy = hit.side === 'enemy';
-  return { x: atEnemy ? 500 : 134, y: atEnemy ? 29 : 349, text: `-${hit.amount}`, color: atEnemy ? '#ffb199' : '#ff6b5e', age: 0.35 };
+/** Play one full round: your side by `playerSkill`, the Magistrate, combat, next round. */
+function playRound(world, random, playerSkill, aiSkill) {
+  autopilot(world, random, playerSkill);
+  if (world.state.over !== null) return;
+  takeAiTurn(world, random, aiSkill);
+  if (world.state.over !== null) return;
+  world.combat();
+  if (world.state.over !== null) return;
+  world.nextRound();
 }
 
-function playRound(world, playerSkill, enemySkill) {
-  const state = world.state;
-  if (state.phase === 'over') return { events: 0, hits: [] };
-  const moves = world.chooseMoves(state.player, playerSkill);
-  const played = world.applyMoves(state.player, moves);
-  if (state.phase === 'over') return played;
-  const ended = world.endPlayerTurn(enemySkill);
-  return { events: played.events | ended.events, hits: played.hits.concat(ended.hits) };
-}
-
-function playUntil(world, playerSkill, enemySkill, wantedEvent, maxRounds) {
-  let lastHits = [];
-  for (let round = 0; round < maxRounds; round += 1) {
-    const result = playRound(world, playerSkill, enemySkill);
-    lastHits = result.hits;
-    if (world.state.phase === 'over') break;
-    if (result.events & wantedEvent) break;
+function playUntil(world, random, playerSkill, aiSkill, stopRound) {
+  for (let round = 0; round < MAX_ROUNDS; round += 1) {
+    if (world.state.over !== null) return;
+    if (stopRound !== null && world.state.round >= stopRound) return;
+    playRound(world, random, playerSkill, aiSkill);
   }
-  return lastHits;
 }
 
 /**
- * Set `world` to the named scene and return the screen to draw over it, the
- * best result to show, and any floating damage numbers left from the last
- * combat.
+ * Set `world` to the named scene (title, play, win or loss; any other name is title)
+ * and return the screen to draw over it.
  */
-export function stageShot(name, world) {
-  world.reset();
+export function stageShot(name, world, random) {
+  world.beginGame();
+  if (name === 'title') {
+    // A lively table behind the title panel: creatures on both sides, hands dealt.
+    world.spawnCreature('you', 'ember-knight', 0);
+    world.spawnCreature('you', 'thorn-sprout', 1);
+    world.spawnCreature('you', 'gale-hawk', 2);
+    world.spawnCreature('foe', 'tide-serpent', 0);
+    world.spawnCreature('foe', 'ember-imp', 1);
+    world.spawnCreature('foe', 'thorn-bramble', 2);
+    world.state.you.hp = 24;
+    world.state.foe.hp = 19;
+    world.state.you.mana = 3;
+    world.state.you.maxMana = 3;
+    world.state.foe.shield = 4;
+    return { screen: SCREEN_TITLE };
+  }
   if (name === 'play') {
-    playUntil(world, 'strong', 'strong', 0, PLAY_ROUNDS);
-    return { screen: SCREEN_PLAY, best: 0, floaters: [] };
+    playUntil(world, random, 'strong', 'strong', PLAY_ROUNDS);
+    return { screen: SCREEN_PLAY };
   }
   if (name === 'win') {
-    const hits = playUntil(world, 'strong', 'weak', EVENT_WIN, LIMIT_ROUNDS);
-    const won = world.state.winner === 'player';
-    return {
-      screen: won ? SCREEN_OVER : SCREEN_PLAY,
-      best: won ? world.state.round : 0,
-      floaters: hits.map(floaterForHit).filter(Boolean),
-    };
+    playUntil(world, random, 'strong', 'weak', null);
+    return { screen: world.state.over === 'won' ? SCREEN_WON : SCREEN_PLAY };
   }
   if (name === 'loss') {
-    const hits = playUntil(world, 'passive', 'strong', EVENT_LOSS, LIMIT_ROUNDS);
-    const lost = world.state.winner === 'enemy';
-    return {
-      screen: lost ? SCREEN_OVER : SCREEN_PLAY,
-      best: 0,
-      floaters: hits.map(floaterForHit).filter(Boolean),
-    };
+    playUntil(world, random, 'passive', 'normal', null);
+    return { screen: world.state.over === 'lost' ? SCREEN_LOST : SCREEN_PLAY };
   }
-  // Title: a lively table behind the title panel.
-  playUntil(world, 'strong', 'strong', 0, TITLE_ROUNDS);
-  return { screen: SCREEN_TITLE, best: 0, floaters: [] };
+  return { screen: SCREEN_TITLE };
 }

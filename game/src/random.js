@@ -1,24 +1,24 @@
-// A small deterministic generator (mulberry32) so a seed fixes every shuffle
-// and every AI choice. The same seed always deals the same game.
+// A small seeded random number generator (mulberry32): the same seed gives the same
+// shuffle and the same game, which is what makes the screenshot scenes repeatable.
 
 export function createRandom(seed) {
-  let state = seed >>> 0;
+  let a = seed | 0;
   return function random() {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let value = state;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-/** Fisher-Yates shuffle, in place, using the seeded generator. */
-export function shuffle(array, random) {
-  for (let index = array.length - 1; index > 0; index -= 1) {
-    const other = Math.floor(random() * (index + 1));
-    const held = array[index];
-    array[index] = array[other];
-    array[other] = held;
+/** Shuffle a copy of `items` in place order using `random`, and return it. */
+export function shuffle(items, random) {
+  const out = items.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    const tmp = out[i];
+    out[i] = out[j];
+    out[j] = tmp;
   }
-  return array;
+  return out;
 }
